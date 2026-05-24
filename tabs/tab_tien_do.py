@@ -1,0 +1,1324 @@
+
+
+from __future__ import annotations
+
+from logger import get_logger
+logger = get_logger(__name__)
+
+import json
+from datetime import datetime, date
+from io import BytesIO
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+import db
+from auth import normalize_role, la_admin_cn
+from config import DS_PGD, DON_VI_CHI_NHANH, PGD_XA_MAP, ROLES_PHAN_HE_CN
+from services import tien_do_service
+from services.task_data_service import (
+    _doc_tasks,
+    _doc_ketqua_task,
+    _khoi_tao_ketqua_task,
+    _sync_bien_hoa_ketqua,
+    _upsert_ketqua_xa,
+)
+from services.tien_do_pdf_service import (
+    _xuat_pdf_bao_cao_tien_do,
+    _xuat_pdf_tien_do,
+)
+from services.tien_do_excel_service import xuat_excel_tien_do as _xuat_excel_tien_do
+from utils import fmt_ngay, lazy_tabs
+
+DS_PGD_ALL = [DON_VI_CHI_NHANH] + DS_PGD
+_PGD_BIEN_HOA = "Địa bàn Biên Hòa"
+
+LOAI_TASK = {
+    "chung":            "📋 Công việc chung",
+    "chi_tieu_khtd":    "🎯 Chỉ tiêu KHTD",
+    "ho_so_rui_ro":     "🗂️ Hồ sơ rủi ro",
+    "khao_sat_nhu_cau": "📊 Khảo sát nhu cầu vay vốn",
+    "bao_cao":          "📄 Báo cáo",
+    "tap_huan":         "🎓 Tập huấn",
+    "giao_dich_xa":     "📅 Giao dịch xã",
+    "uy_thac":          "🤝 Hoạt động ủy thác",
+    "nguon_von":        "💰 Nguồn vốn",
+    "ban_dai_dien":     "📑 Ban đại diện HĐQT",
+    "khac":             "Khác",
+}
+UU_TIEN = {
+    "khan_cap":    "🔴 Khẩn cấp",
+    "quan_trong":  "🟡 Quan trọng",
+    "binh_thuong": "🟢 Bình thường",
+}
+TS_KQ_LABEL = {
+    "chua_thuc_hien": "⬜ Chưa",
+    "da_hoan_thanh":  "✅ Xong",
+    "khong_ap_dung":  "➖ N/A",
+}
+UU_TIEN_ORDER = {"khan_cap": 0, "quan_trong": 1, "binh_thuong": 2}
+
+
+def _render_tong_quan(tab, **kwargs):
+    import streamlit as _st
+    _tab_ctx = tab if tab is not None else _st.container()
+    with _tab_ctx:
+        st.subheader("📊 Tổng quan tiến độ")
+
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            ngay_loc = st.date_input("Thời hạn đến ngày",
+                                     value=date.today(), format="DD/MM/YYYY", key="td_ngay")
+        with c2:
+            loai_loc = st.selectbox("Lọc loại", ["Tất cả"] + list(LOAI_TASK.values()),
+                                    key="td_loai")
+        with c3:
+            nd_loc = st.selectbox("Loại nhiệm vụ",
+                                  ["Tất cả", "Chung PGD", "Chi tiết xã"],
+                                  key="td_nd")
+
+        hom_nay = date.today().isoformat()
+        ds_task = _doc_tasks()
+        ds_task = [t for t in ds_task
+                   if t["ngay_deadline"] <= ngay_loc.isoformat()]
+        if loai_loc != "Tất cả":
+            loai_key = next((k for k, v in LOAI_TASK.items() if v == loai_loc), None)
+            ds_task = [t for t in ds_task if loai_key and t["loai"] == loai_key]
+        if nd_loc != "Tất cả":
+            nd_map = {"Chung PGD": "pgd", "Chi tiết xã": "xa"}
+            ds_task = [t for t in ds_task if t.get("cap_theo_doi") == nd_map.get(nd_loc)]
+
+        if not ds_task:
+            st.info("Không có đầu việc nào trong khoảng thời gian đã chọn.")
+            return
+
+        all_kq = {t["id"]: _doc_ketqua_task(t["id"]) for t in ds_task}
+        tong_xa = sum(len(v) for v in all_kq.values())
+        tong_xong = sum(
+            sum(1 for r in v if r["trang_thai"] == "da_hoan_thanh")
+            for v in all_kq.values()
+        )
+        # Tính % trung bình từ pct_hoan_thanh (nếu có dữ liệu)
+        all_pct = [
+            int(r.get("pct_hoan_thanh") or 0)
+            for v in all_kq.values()
+            for r in v
+        ]
+        pct_avg = round(sum(all_pct) / len(all_pct)) if all_pct else 0
+        # Dùng pct_avg nếu có dữ liệu %, ngược lại fallback về count-based %
+        pct_hien_thi = pct_avg if pct_avg > 0 else (round(tong_xong / tong_xa * 100) if tong_xa else 0)
+        tong_tre = 0
+        for t in ds_task:
+            kq = all_kq.get(t["id"], [])
+            for r in kq:
+                if r["trang_thai"] == "chua_thuc_hien" and t["ngay_deadline"] < hom_nay:
+                    tong_tre += 1
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Đầu việc", len(ds_task))
+        c2.metric("✅ Hoàn thành",
+                  f"{tong_xong}/{tong_xa}",
+                  f"{pct_hien_thi}%")
+        c3.metric("🔴 Trễ hạn", tong_tre, delta_color="inverse")
+        c4.metric("⬜ Chưa báo cáo", tong_xa - tong_xong - tong_tre)
+
+        st.markdown("#### 📋 Danh sách đầu việc")
+        df_task_list = pd.DataFrame([
+            {
+                "Đầu việc": t.get("tieu_de", ""),
+                "Thời hạn": fmt_ngay(t.get("ngay_deadline", "")),
+                "Loại": LOAI_TASK.get(t.get("loai", ""), t.get("loai", "")),
+                "Người phụ trách": t.get("nguoi_phu_trach") or "",
+                "CB KH-NV phụ trách": t.get("nguoi_thuc_hien_cn") or "",
+                "Hội sở CN tỉnh": t.get("cbtd_bien_hoa") or "",
+                "Ưu tiên": UU_TIEN.get(t.get("uu_tien", ""), t.get("uu_tien", "")),
+                "Theo dõi": "Chung PGD" if t.get("cap_theo_doi") == "pgd" else "Chi tiết xã",
+            }
+            for t in ds_task
+        ])
+        st.dataframe(df_task_list, use_container_width=True, hide_index=True, height=340)
+
+        st.divider()
+
+        st.markdown("#### 🗺️ Bảng tiến độ theo PGD")
+        st.caption("Ô trong bảng = Hoàn thành / Tổng số. 🔴 = có đơn vị trễ hạn.")
+
+        bang_rows = []
+        for pgd in DS_PGD_ALL:
+            row = {"Đơn vị": pgd}
+            for t in ds_task:
+                kq_pgd = [r for r in all_kq.get(t["id"], []) if r["pgd"] == pgd]
+                if not kq_pgd:
+                    row[t["tieu_de"][:18]] = "—"
+                    continue
+                xong = sum(1 for r in kq_pgd if r["trang_thai"] == "da_hoan_thanh")
+                tre = sum(1 for r in kq_pgd
+                          if r["trang_thai"] == "chua_thuc_hien"
+                          and t["ngay_deadline"] < hom_nay)
+                tong = len(kq_pgd)
+                ky_hieu = "🔴 " if tre > 0 else ("✅ " if xong == tong else "")
+                row[t["tieu_de"][:18]] = f"{ky_hieu}{xong}/{tong}"
+            bang_rows.append(row)
+
+        df_pgd = pd.DataFrame(bang_rows)
+        st.dataframe(df_pgd, use_container_width=True, hide_index=True, height=620)
+
+        st.divider()
+
+        st.markdown("#### 📈 Tỷ lệ hoàn thành theo đầu việc")
+        chart_rows = []
+        for t in ds_task:
+            kq = all_kq.get(t["id"], [])
+            xong = sum(1 for r in kq if r["trang_thai"] == "da_hoan_thanh")
+            tong = len(kq)
+            chart_rows.append({
+                "Đầu việc": t["tieu_de"][:35],
+                "% Hoàn thành": round(xong / tong * 100) if tong else 0,
+                "Ưu tiên": UU_TIEN.get(t["uu_tien"], ""),
+                "Thời hạn": fmt_ngay(t["ngay_deadline"]),
+            })
+        df_chart = pd.DataFrame(chart_rows)
+        color_map = {
+            "🔴 Khẩn cấp": "#ef4444",
+            "🟡 Quan trọng": "#f59e0b",
+            "🟢 Bình thường": "#22c55e",
+        }
+        fig = px.bar(
+            df_chart, x="% Hoàn thành", y="Đầu việc",
+            orientation="h", color="Ưu tiên",
+            color_discrete_map=color_map,
+            text="% Hoàn thành", range_x=[0, 100],
+            height=max(300, len(ds_task) * 50),
+        )
+        fig.update_traces(texttemplate="%{text}%", textposition="outside")
+        fig.update_layout(margin=dict(l=10, r=40, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True, key="td_chart_tongquan")
+
+        st.divider()
+
+        st.markdown("#### 🔍 Drill-down theo PGD")
+        _DD_TAT_CA = "— Tất cả —"
+        col_pgd, col_task = st.columns(2)
+        with col_pgd:
+            pgd_dd = st.selectbox("Chọn đơn vị", [_DD_TAT_CA] + DS_PGD_ALL, key="td_dd_pgd")
+        with col_task:
+            task_dd_options = {t["id"]: t["tieu_de"] for t in ds_task}
+            task_dd_id = st.selectbox(
+                "Chọn đầu việc",
+                options=list(task_dd_options.keys()),
+                format_func=lambda x: task_dd_options[x],
+                key="td_dd_task",
+            )
+
+        if pgd_dd and task_dd_id:
+            _tat_ca = pgd_dd == _DD_TAT_CA
+            kq_xa = (
+                all_kq.get(task_dd_id, [])
+                if _tat_ca
+                else [r for r in all_kq.get(task_dd_id, []) if r["pgd"] == pgd_dd]
+            )
+            task_sel = next((t for t in ds_task if t["id"] == task_dd_id), None)
+            _label = "Tất cả đơn vị" if _tat_ca else pgd_dd
+
+            if not kq_xa or task_sel is None:
+                st.info(f"{_label} không có xã nào trong đầu việc này.")
+            else:
+                xong = sum(1 for r in kq_xa if r["trang_thai"] == "da_hoan_thanh")
+                st.caption(
+                    f"**{_label}** — {task_sel['tieu_de']} · "
+                    f"Hoàn thành: **{xong}/{len(kq_xa)}** · "
+                    f"Thời hạn: {fmt_ngay(task_sel['ngay_deadline'])}"
+                )
+                _cols = (
+                    ["Đơn vị", "Xã / Phường", "Trạng thái", "Ngày HT", "Ghi chú", "Người nhập"]
+                    if _tat_ca
+                    else ["Xã / Phường", "Trạng thái", "Ngày HT", "Ghi chú", "Người nhập"]
+                )
+                df_xa = pd.DataFrame([
+                    {
+                        **({"Đơn vị": r["pgd"]} if _tat_ca else {}),
+                        "Xã / Phường": r["ten_xa"],
+                        "Trạng thái": TS_KQ_LABEL.get(r["trang_thai"], r["trang_thai"]),
+                        "Ngày HT": fmt_ngay(r.get("ngay_hoan_thanh")) or "—",
+                        "Ghi chú": r.get("ghi_chu") or "",
+                        "Người nhập": r.get("nguoi_nhap") or "",
+                    }
+                    for r in kq_xa
+                ])
+                st.dataframe(df_xa[_cols], use_container_width=True, hide_index=True)
+
+
+def _render_tao_task(tab, **kwargs):
+    username = kwargs.get("username", "")
+    _tab_ctx = tab if tab is not None else __import__('streamlit').container()
+    with _tab_ctx:
+        st.subheader("➕ Tạo đầu việc mới")
+
+        with st.expander("📖 Hướng dẫn tạo đầu việc", expanded=False):
+            st.markdown("""
+**1. Tên đầu việc** — Đặt tên ngắn gọn, rõ ràng.  
+VD: *Nộp hồ sơ rủi ro tháng 5/2026*, *Khảo sát nhu cầu vay vốn Q2*
+
+**2. Mô tả / Hướng dẫn** — Ghi rõ nội dung cần thực hiện, tài liệu tham khảo,
+lưu ý đặc biệt để PGD/CBTD biết cần làm gì.
+
+**3. Loại** — Phân loại đầu việc:
+- 📋 Công việc chung — việc hành chính, tổng hợp
+- 🎯 Chỉ tiêu KHTD — giao/điều chỉnh chỉ tiêu tín dụng cho PGD/xã
+- 🗂️ Hồ sơ rủi ro — liên quan nợ xấu, NQH, xử lý rủi ro
+- 📊 Khảo sát nhu cầu — điều tra nhu cầu vay vốn
+- 📄 Báo cáo — các loại báo cáo định kỳ, thống kê
+- 🎓 Tập huấn — đào tạo, hướng dẫn nghiệp vụ
+- 📅 Giao dịch xã — tổ chức, kiểm tra hoạt động giao dịch xã
+- 🤝 Hoạt động ủy thác — kiểm tra, giám sát 4 tổ chức CT-XH
+- 💰 Nguồn vốn — theo dõi quỹ, điện báo xin vốn, huy động
+- 📑 Ban đại diện HĐQT — phiên họp, nghị quyết, kiểm tra giám sát
+
+**4. Loại theo dõi** — Quan trọng!
+- 📍 **Chi tiết từng xã** — hệ thống tạo 1 dòng theo dõi cho mỗi xã/phường  
+  → Dùng khi cần biết xã nào đã làm, xã nào chưa
+- 🏢 **Chung PGD** — hệ thống tạo 1 dòng theo dõi cho mỗi PGD  
+  → Dùng khi chỉ cần biết PGD đã hoàn thành chưa
+
+**5. Ưu tiên** — 🔴 Khẩn cấp / 🟡 Quan trọng / 🟢 Bình thường  
+Ảnh hưởng màu sắc hiển thị trong biểu đồ tổng quan.
+
+**6. Ngày bắt đầu & Hạn hoàn thành** — Xác định khung thời gian.  
+Sau thời hạn hệ thống tự đánh dấu 🔴 trễ hạn.
+
+**7. Áp dụng cho đơn vị** — Mặc định tất cả 22 đơn vị.  
+Bỏ chọn nếu chỉ áp dụng cho một số PGD cụ thể.
+
+**8. Người phụ trách** — Ghi tên cán bộ chịu trách nhiệm theo dõi đầu việc này.
+            """)
+
+        # ── Tạo từ mẫu ──────────────────────────────────────────────────────
+        try:
+            with db.get_conn() as conn:
+                _templates = [dict(r) for r in conn.execute(
+                    "SELECT * FROM tien_do_template ORDER BY ten"
+                ).fetchall()]
+        except Exception:
+            _templates = []
+
+        if _templates:
+            _tmpl_options = ["— Tạo mới (không dùng mẫu) —"] + [t["ten"] for t in _templates]
+            c_tmpl, c_apply = st.columns([3, 1])
+            with c_tmpl:
+                _tmpl_sel = st.selectbox(
+                    "📋 Tạo từ mẫu",
+                    _tmpl_options,
+                    key="td_chon_mau",
+                    label_visibility="collapsed",
+                )
+            with c_apply:
+                if _tmpl_sel != _tmpl_options[0]:
+                    if st.button("▶️ Áp dụng mẫu", use_container_width=True, key="td_apply_mau"):
+                        _t = next((t for t in _templates if t["ten"] == _tmpl_sel), None)
+                        if _t:
+                            st.session_state["tao_task_tieu_de"] = _t["ten"]
+                            st.session_state["tao_task_loai"] = _t.get("loai") or "chung"
+                            st.session_state["tao_task_uu_tien"] = _t.get("uu_tien") or "binh_thuong"
+                            st.session_state["tao_task_loai_theo_doi"] = _t.get("cap_theo_doi") or "xa"
+                            st.rerun()
+
+        with st.form("form_tao_task", clear_on_submit=False):
+            tieu_de = st.text_area("Tên đầu việc *",
+                                   placeholder="VD: Nộp hồ sơ rủi ro tháng 5/2026",
+                                   height=68,
+                                   key="tao_task_tieu_de")
+            mo_ta = st.text_area("Mô tả / Hướng dẫn", key="tao_task_mo_ta")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                loai = st.selectbox("Loại", list(LOAI_TASK.keys()),
+                                    format_func=lambda x: LOAI_TASK[x],
+                                    key="tao_task_loai")
+                loai_theo_doi = st.radio(
+                    "Loại theo dõi",
+                    options=["xa", "pgd"],
+                    format_func=lambda x: "📍 Chi tiết từng xã" if x == "xa" else "🏢 Chung PGD",
+                    horizontal=True,
+                    key="tao_task_loai_theo_doi",
+                )
+                uu_tien = st.selectbox("Ưu tiên", list(UU_TIEN.keys()),
+                                       format_func=lambda x: UU_TIEN[x], index=2,
+                                       key="tao_task_uu_tien")
+                nguoi_phu_trach = st.text_area(
+                    "Người phụ trách",
+                    placeholder="Tên người phụ trách chính",
+                    height=68,
+                    key="tao_task_nguoi_pt",
+                )
+                nguoi_thuc_hien_cn = st.text_input(
+                    "👤 Cán bộ phòng KH-NV phụ trách",
+                    placeholder="Họ tên cán bộ KH-NV phụ trách nội dung này...",
+                    key="tao_task_nguoi_thuc_hien_cn",
+                )
+            with c2:
+                deadline = st.date_input("Ngày kết thúc *", value=date.today(),
+                                          format="DD/MM/YYYY", key="tao_task_deadline")
+                ngay_bat_dau = st.date_input(
+                    "Ngày bắt đầu",
+                    value=date.today(),
+                    format="DD/MM/YYYY",
+                    key="tao_task_ngay_bat_dau",
+                )
+
+            st.markdown("**📋 Áp dụng cho đơn vị**")
+            st.caption(
+                "Chọn đơn vị chịu trách nhiệm thực hiện đầu việc này. "
+                "Mỗi đơn vị được chọn sẽ có 1 dòng cập nhật tiến độ riêng. "
+                "Có thể áp dụng đồng thời cho PGD huyện và Hội sở CN tỉnh."
+            )
+            st.markdown("**🏢 Phòng giao dịch trực thuộc**")
+            _cc1, _cc2, _cc3 = st.columns(3)
+            pgd_chon = []
+            for _j, _pgd in enumerate(DS_PGD):
+                _i = _j + 1
+                with [_cc1, _cc2, _cc3][_j % 3]:
+                    if st.checkbox(_pgd, value=True, key=f"tao_task_pgd_{_i}"):
+                        pgd_chon.append(_pgd)
+
+            ds_preview = pgd_chon or DS_PGD
+            _so_chon = len(pgd_chon)
+            _so_bo = len(DS_PGD) - _so_chon
+            _thong_ke = f"✅ **{_so_chon}** đơn vị được chọn"
+            if _so_bo > 0:
+                _khong_chon = [p for p in DS_PGD if p not in pgd_chon]
+                _thong_ke += f" · ❌ **{_so_bo}** không chọn: {', '.join(_khong_chon)}"
+            st.caption(_thong_ke)
+            st.caption(
+                "Tick chọn PGD nào phải thực hiện. "
+                "Trưởng/Phó PGD sẽ cập nhật tiến độ cho đơn vị mình."
+            )
+
+            st.divider()
+
+            st.markdown("**🏛️ Hội sở CN tỉnh**")
+            cbtd_bien_hoa = st.text_input(
+                "Cán bộ KH-NV phụ trách",
+                placeholder="Họ tên CBTD Hội sở phụ trách địa bàn Biên Hòa...",
+                key="tao_task_cbtd_bien_hoa",
+            )
+            st.caption(
+                "Địa bàn TP. Biên Hòa không có PGD riêng — CBTD tại Hội sở CN tỉnh "
+                "trực tiếp quản lý. Điền tên cán bộ KH-NV phụ trách nếu đầu việc "
+                "này áp dụng cho địa bàn Biên Hòa. Để trống nếu không áp dụng."
+            )
+            if loai_theo_doi == "pgd":
+                st.caption(f"🏢 {len(ds_preview)} đơn vị — theo dõi cấp PGD")
+            else:
+                tong_xa_preview = sum(
+                    len(PGD_XA_MAP.get(p, [])) for p in ds_preview
+                )
+                st.caption(
+                    f"📍 {len(ds_preview)} đơn vị · {tong_xa_preview} xã/phường"
+                )
+            submitted = st.form_submit_button("💾 Tạo đầu việc", type="primary")
+
+        if submitted:
+            if not tieu_de.strip():
+                st.error("Vui lòng nhập tên đầu việc.")
+                return
+            pgd_luu = pgd_chon or DS_PGD
+            try:
+                task_id = tien_do_service.tao_task(
+                    tieu_de=tieu_de.strip(),
+                    mo_ta=mo_ta.strip() or None,
+                    deadline=deadline,
+                    ds_pgd=pgd_luu,
+                    loai=loai,
+                    uu_tien=uu_tien,
+                    username=username,
+                    cap_theo_doi=loai_theo_doi,
+                    ngay_bat_dau=ngay_bat_dau,
+                    nguoi_phu_trach=nguoi_phu_trach.strip() or None,
+                    nguoi_thuc_hien_cn=str(nguoi_thuc_hien_cn).strip(),
+                    cbtd_bien_hoa=str(cbtd_bien_hoa).strip(),
+                )
+
+                so_xa = (
+                    sum(len(PGD_XA_MAP.get(p, [])) for p in pgd_luu)
+                    if loai_theo_doi == "xa" else len(pgd_luu)
+                )
+                db.ghi_audit(username, "tien_do_tao_task",
+                             f"'{tieu_de}' · thời hạn={deadline} · "
+                             f"{len(pgd_luu)} PGD · "
+                             f"{so_xa} đơn vị {loai_theo_doi} · "
+                             f"cap_theo_doi={loai_theo_doi} · "
+                             f"cbtd_bien_hoa={str(cbtd_bien_hoa).strip()}")
+                st.toast(f"✅ Đã tạo: {tieu_de}")
+                st.rerun()
+            except Exception as e:
+                logger.error("Lỗi tạo đầu việc '%s': %s", tieu_de, e, exc_info=True)
+                st.error(f"Lỗi: {e}")
+
+
+def _render_quan_ly_task(tab, **kwargs):
+    username = kwargs.get("username", "")
+    role_raw = str(kwargs.get("role", "user") or "user")
+    role = normalize_role(role_raw)
+
+    _tab_ctx = tab if tab is not None else __import__("streamlit").container()
+    with _tab_ctx:
+        st.subheader("✏️ Chỉnh sửa & Xóa đầu việc")
+
+        ds_task = _doc_tasks(chi_dang_theo_doi=False)
+        if not ds_task:
+            st.info("Chưa có đầu việc nào.")
+            return
+
+        task_map = {t["id"]: t for t in ds_task}
+
+        def _fmt_task(task_id: int) -> str:
+            t = task_map.get(task_id) or {}
+            if t.get("trang_thai") == "dang_theo_doi":
+                try:
+                    dl = date.fromisoformat(t.get("ngay_deadline", ""))
+                    stt = "⚠️ Đã hết hạn" if dl < date.today() else "🟢 Đang thực hiện"
+                except Exception as e:  # conv: skip
+                    logger.warning("Không parse ngày deadline (fmt_task) task_id=%s: %s", task_id, e)
+                    stt = "🟢 Đang thực hiện"
+            else:
+                stt = "🔒 Đã đóng"
+            parts = [stt, t.get("tieu_de", "")]
+            ngay_bd = t.get("ngay_bat_dau")
+            if ngay_bd:
+                parts.append(f"BĐ: {fmt_ngay(ngay_bd)}")
+            parts.append(f"KT: {fmt_ngay(t.get('ngay_deadline', ''))}")
+            return " · ".join(parts)
+
+        task_id = st.selectbox(
+            "Chọn đầu việc",
+            options=list(task_map.keys()),
+            format_func=_fmt_task,
+            key="td_ql_task",
+        )
+        task = task_map.get(task_id)
+        if not task:
+            return
+
+        try:
+            deadline_default = date.fromisoformat(str(task.get("ngay_deadline") or date.today().isoformat()))
+        except Exception as e:  # conv: skip
+            logger.warning("Không parse được ngày deadline task_id=%s: %s", task_id, e)
+            deadline_default = date.today()
+
+        loai_keys = list(LOAI_TASK.keys())
+        uu_tien_keys = list(UU_TIEN.keys())
+
+        try:
+            loai_index = loai_keys.index(task.get("loai")) if task.get("loai") in loai_keys else 0
+        except Exception as e:  # conv: skip
+            logger.warning("Không tìm được loai_index task_id=%s: %s", task_id, e)
+            loai_index = 0
+
+        try:
+            uu_tien_index = uu_tien_keys.index(task.get("uu_tien")) if task.get("uu_tien") in uu_tien_keys else 2
+        except Exception as e:  # conv: skip
+            logger.warning("Không tìm được uu_tien_index task_id=%s: %s", task_id, e)
+            uu_tien_index = 2
+
+        with st.form("form_sua_task"):
+            tieu_de = st.text_area(
+                "Tên đầu việc *",
+                value=str(task.get("tieu_de") or ""),
+                height=68,
+                key=f"td_sua_tieu_de_{task_id}",
+            )
+            mo_ta = st.text_area(
+                "Mô tả / Hướng dẫn",
+                value=str(task.get("mo_ta") or ""),
+                key=f"td_sua_mo_ta_{task_id}",
+            )
+            loai = st.selectbox(
+                "Loại",
+                options=loai_keys,
+                format_func=lambda x: LOAI_TASK.get(x, x),
+                index=loai_index,
+                key=f"td_sua_loai_{task_id}",
+            )
+            uu_tien = st.selectbox(
+                "Ưu tiên",
+                options=uu_tien_keys,
+                format_func=lambda x: UU_TIEN.get(x, x),
+                index=uu_tien_index,
+                key=f"td_sua_uu_tien_{task_id}",
+            )
+            deadline = st.date_input(
+                "Ngày kết thúc *",
+                value=deadline_default,
+                format="DD/MM/YYYY",
+                key=f"td_sua_deadline_{task_id}",
+            )
+            ghi_chu = st.text_area(
+                "Ghi chú thêm",
+                value=str(task.get("ghi_chu") or ""),
+                height=68,
+                key=f"td_sua_ghi_chu_{task_id}",
+            )
+            nguoi_phu_trach = st.text_area(
+                "Người phụ trách",
+                value=str(task.get("nguoi_phu_trach") or ""),
+                height=68,
+                key=f"td_sua_nguoi_pt_{task_id}",
+            )
+            nguoi_thuc_hien_cn = st.text_input(
+                "👤 Cán bộ phòng KH-NV phụ trách",
+                value=str(task.get("nguoi_thuc_hien_cn") or ""),
+                placeholder="Họ tên cán bộ KH-NV phụ trách nội dung này...",
+                key=f"td_sua_nguoi_thuc_hien_cn_{task_id}",
+            )
+            ngay_bat_dau_val = date.today()
+            try:
+                ngay_bat_dau_val = date.fromisoformat(
+                    str(task.get("ngay_bat_dau") or date.today().isoformat())
+                )
+            except Exception as e:  # conv: skip
+                logger.warning("Không parse được ngày_bắt_đầu task_id=%s: %s", task_id, e)
+            ngay_bat_dau = st.date_input(
+                "Ngày bắt đầu",
+                value=ngay_bat_dau_val,
+                format="DD/MM/YYYY",
+                key=f"td_sua_ngay_bat_dau_{task_id}",
+            )
+            cap_theo_doi_keys = ["xa", "pgd"]
+            cap_theo_doi_idx = cap_theo_doi_keys.index(
+                task.get("cap_theo_doi", "xa")
+            ) if task.get("cap_theo_doi") in cap_theo_doi_keys else 0
+            cap_theo_doi = st.radio(
+                "Loại theo dõi",
+                options=cap_theo_doi_keys,
+                format_func=lambda x: "📍 Chi tiết từng xã" if x == "xa" else "🏢 Chung PGD",
+                index=cap_theo_doi_idx,
+                horizontal=True,
+                key=f"td_sua_cap_theo_doi_{task_id}",
+            )
+
+            st.markdown("**📋 Áp dụng cho đơn vị**")
+            st.caption(
+                "Chọn đơn vị chịu trách nhiệm thực hiện đầu việc này. "
+                "Mỗi đơn vị được chọn sẽ có 1 dòng cập nhật tiến độ riêng. "
+                "Có thể áp dụng đồng thời cho PGD huyện và Hội sở CN tỉnh."
+            )
+            st.markdown("**🏢 Phòng giao dịch trực thuộc**")
+            ds_pgd_task = json.loads(task.get("ds_pgd") or "[]") or DS_PGD
+            _c1, _c2, _c3 = st.columns(3)
+            for _j, _pgd in enumerate(DS_PGD):
+                _i = _j + 1
+                with [_c1, _c2, _c3][_j % 3]:
+                    st.checkbox(
+                        _pgd,
+                        value=_pgd in ds_pgd_task,
+                        key=f"td_sua_pgd_{task_id}_{_i}",
+                        disabled=True,
+                    )
+            st.caption(
+                "Tick chọn PGD nào phải thực hiện. "
+                "Trưởng/Phó PGD sẽ cập nhật tiến độ cho đơn vị mình. "
+                "Danh sách PGD không thể thay đổi sau khi tạo — nếu cần, hãy đóng đầu việc này và tạo mới."
+            )
+
+            st.divider()
+
+            st.markdown("**🏛️ Hội sở CN tỉnh**")
+            cbtd_bien_hoa = st.text_input(
+                "Cán bộ KH-NV phụ trách",
+                value=str(task.get("cbtd_bien_hoa") or ""),
+                placeholder="Họ tên CBTD Hội sở phụ trách địa bàn Biên Hòa...",
+                key=f"td_sua_cbtd_bien_hoa_{task_id}",
+            )
+            st.caption(
+                "Địa bàn TP. Biên Hòa không có PGD riêng — CBTD tại Hội sở CN tỉnh "
+                "trực tiếp quản lý. Điền tên cán bộ KH-NV phụ trách nếu đầu việc "
+                "này áp dụng cho địa bàn Biên Hòa. Để trống nếu không áp dụng."
+            )
+
+            submitted = st.form_submit_button("💾 Lưu thay đổi", type="primary")
+
+        if submitted:
+            if not str(tieu_de or "").strip():
+                st.error("Vui lòng nhập tên đầu việc.")
+                return
+            try:
+                tien_do_service.cap_nhat_task(
+                    task_id=task_id,
+                    tieu_de=str(tieu_de).strip(),
+                    mo_ta=str(mo_ta).strip() or None,
+                    deadline=deadline,
+                    loai=loai,
+                    uu_tien=uu_tien,
+                    ghi_chu=str(ghi_chu).strip() or None,
+                    cap_theo_doi=cap_theo_doi,
+                    ngay_bat_dau=ngay_bat_dau,
+                    nguoi_phu_trach=str(nguoi_phu_trach).strip() or None,
+                    nguoi_thuc_hien_cn=str(nguoi_thuc_hien_cn).strip(),
+                    cbtd_bien_hoa=str(cbtd_bien_hoa).strip(),
+                )
+                db.ghi_audit(
+                    username,
+                    "tien_do_sua_task",
+                    f"ID={task_id} · '{str(tieu_de).strip()}' · thời hạn={deadline}",
+                )
+                db.ghi_audit(
+                    username,
+                    "sua_task",
+                    f"Task #{task_id}: cbtd_bien_hoa={str(cbtd_bien_hoa).strip()}",
+                )
+                st.toast("✅ Đã lưu thay đổi.")
+                st.rerun()
+            except Exception as e:
+                logger.error("Lỗi lưu chỉnh sửa task_id=%s: %s", task_id, e, exc_info=True)
+                st.error(f"Lỗi: {e}")
+
+        c1, c2, c3 = st.columns([1.2, 1.2, 1.6])
+        with c1:
+            if task.get("trang_thai") == "dang_theo_doi":
+                if st.button("🔒 Đóng đầu việc", key=f"td_dong_{task_id}", use_container_width=True):
+                    try:
+                        tien_do_service.doi_trang_thai_task(task_id, "da_dong")
+                        db.ghi_audit(
+                            username,
+                            "tien_do_doi_trang_thai",
+                            f"ID={task_id} · '{task.get('tieu_de')}' → da_dong",
+                        )
+                        st.toast("✅ Đã cập nhật trạng thái.")
+                        st.rerun()
+                    except Exception as e:
+                        logger.error("Lỗi đóng task_id=%s: %s", task_id, e, exc_info=True)
+                        st.error(f"Lỗi: {e}")
+            else:
+                if st.button("🔓 Mở lại", key=f"td_mo_lai_{task_id}", use_container_width=True):
+                    try:
+                        tien_do_service.doi_trang_thai_task(task_id, "dang_theo_doi")
+                        db.ghi_audit(
+                            username,
+                            "tien_do_doi_trang_thai",
+                            f"ID={task_id} · '{task.get('tieu_de')}' → dang_theo_doi",
+                        )
+                        st.toast("✅ Đã cập nhật trạng thái.")
+                        st.rerun()
+                    except Exception as e:
+                        logger.error("Lỗi mở lại task_id=%s: %s", task_id, e, exc_info=True)
+                        st.error(f"Lỗi: {e}")
+
+        if la_admin_cn(role):
+            confirm_key = f"_td_xoa_confirm_{task_id}"
+            with c3:
+                if not st.session_state.get(confirm_key):
+                    if st.button("🗑️ Xóa vĩnh viễn", key=f"td_xoa_{task_id}", use_container_width=True):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                else:
+                    st.warning("⚠️ Hành động này không thể hoàn tác.")
+                    if st.button("Xác nhận xóa", key=f"td_xoa_ok_{task_id}", type="primary", use_container_width=True):
+                        try:
+                            tien_do_service.xoa_task(task_id)
+                            db.ghi_audit(
+                                username,
+                                "tien_do_xoa_task",
+                                f"ID={task_id} · '{task.get('tieu_de')}'",
+                            )
+                            st.session_state.pop(confirm_key, None)
+                            st.toast("🗑️ Đã xóa đầu việc.")
+                            st.rerun()
+                        except Exception as e:
+                            logger.error("Lỗi xóa task_id=%s: %s", task_id, e, exc_info=True)
+                            st.error(f"Lỗi: {e}")
+
+
+def _render_cap_nhat(tab, **kwargs):
+    username = kwargs.get("username", "")
+    role = kwargs.get("role", "user")
+    pgd_user = kwargs.get("pgd_user") or ""
+
+    _tab_ctx = tab if tab is not None else __import__('streamlit').container()
+    with _tab_ctx:
+        ds_task = _doc_tasks()
+        if not ds_task:
+            st.info("Chưa có đầu việc nào đang theo dõi.")
+            return
+
+        # ── Khối 1: CHỌN ĐẦU VIỆC ────────────────────────────────────────
+        with st.container(border=True):
+            st.markdown("**① CHỌN ĐẦU VIỆC**")
+
+            hom_nay = date.today()
+            def _fmt_cap_nhat_opt(t):
+                try:
+                    dl = date.fromisoformat(t["ngay_deadline"])
+                    stt = "⚠️ Đã hết hạn" if dl < hom_nay else "🟢 Đang thực hiện"
+                except Exception as e:  # conv: skip
+                    logger.warning("Không parse ngày deadline (fmt_cap_nhat_opt): %s", e)
+                    stt = "🟢 Đang thực hiện"
+                ngay_bd = t.get("ngay_bat_dau")
+                parts = [stt, t["tieu_de"]]
+                if ngay_bd:
+                    parts.append(f"BĐ: {fmt_ngay(ngay_bd)}")
+                parts.append(f"⏰ KT: {fmt_ngay(t['ngay_deadline'])}")
+                return " · ".join(parts)
+
+            task_opts = {t["id"]: _fmt_cap_nhat_opt(t) for t in ds_task}
+            task_id = st.selectbox(
+                "Đầu việc",
+                list(task_opts.keys()),
+                format_func=lambda x: task_opts[x],
+                key="td_cu_task",
+            )
+            task = next((t for t in ds_task if t["id"] == task_id), None)
+            if task is None:
+                return
+
+            cap_theo_doi = task.get("cap_theo_doi", "xa")
+            tag_nd = "🏢 Chung PGD" if cap_theo_doi == "pgd" else "🏘️ Chi tiết xã"
+            nguoi_pt = task.get("nguoi_phu_trach") or ""
+            nguoi_thuc_hien_cn = task.get("nguoi_thuc_hien_cn") or ""
+            cbtd_bien_hoa = task.get("cbtd_bien_hoa") or ""
+
+            try:
+                deadline_date = date.fromisoformat(task["ngay_deadline"])
+                if deadline_date < hom_nay:
+                    badge = "⚠️ Đã hết hạn"
+                elif (deadline_date - hom_nay).days <= 3:
+                    badge = "🟠 Sắp hết hạn (≤ 3 ngày)"
+                else:
+                    badge = "🟢 Đang thực hiện"
+            except Exception as e:  # conv: skip
+                logger.warning("Không parse ngày deadline để hiển thị badge: %s", e)
+                badge = ""
+
+            st.caption(
+                f"**{task['tieu_de']}** · "
+                f"{badge} · "
+                f"{tag_nd} · "
+                f"{LOAI_TASK.get(task['loai'], task['loai'])} · "
+                f"{UU_TIEN.get(task['uu_tien'], '')}"
+            )
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.caption(f"📅 Ngày bắt đầu: **{fmt_ngay(task.get('ngay_bat_dau') or '—')}**")
+            with c2:
+                st.caption(f"⏰ Ngày kết thúc: **{fmt_ngay(task['ngay_deadline'])}**")
+            with c3:
+                if nguoi_pt:
+                    st.caption(f"👤 Người PT: **{nguoi_pt}**")
+            if nguoi_thuc_hien_cn:
+                st.caption(f"👤 Cán bộ KH-NV phụ trách: {nguoi_thuc_hien_cn}")
+            if cbtd_bien_hoa:
+                st.caption(f"🏛️ Hội sở CN tỉnh — CB KH-NV: {cbtd_bien_hoa}")
+            if badge:
+                st.info(badge)
+            if task.get("mo_ta"):
+                st.info(task["mo_ta"])
+
+        pgd_user_val = kwargs.get("pgd_user") or ""
+        la_pgd_role = bool(pgd_user_val) and role not in ROLES_PHAN_HE_CN
+
+        # ── Khối 2: CHỌN PHẠM VI ─────────────────────────────────────────
+        if cap_theo_doi == "xa":
+            if la_pgd_role:
+                pgd_sel = pgd_user_val
+            else:
+                with st.container(border=True):
+                    st.markdown("**② CHỌN PHẠM VI**")
+                    ds_pgd_task = json.loads(task.get("ds_pgd") or "[]") or DS_PGD
+                    if cbtd_bien_hoa:
+                        ds_pgd_task = list(ds_pgd_task) + [_PGD_BIEN_HOA]
+                    pgd_sel = st.selectbox(
+                        "Đơn vị PGD",
+                        options=ds_pgd_task,
+                        key=f"td_cap_nhat_pgd_{task_id}",
+                    )
+                    if pgd_sel:
+                        st.caption(f"🏘️ Đang xem: **{pgd_sel}**")
+            if not pgd_sel:
+                st.warning("Tài khoản chưa được gán đơn vị.")
+                return
+            kq_list = [r for r in _doc_ketqua_task(task_id) if r["pgd"] == pgd_sel]
+            ten_cot = "Xã / Phường"
+            label_dv = "xã"
+        else:
+            kq_list = _doc_ketqua_task(task_id)
+            if la_pgd_role:
+                kq_list = [r for r in kq_list if r["pgd"] == pgd_user_val]
+            pgd_sel = "__ALL__"
+            ten_cot = "Đơn vị PGD"
+            label_dv = "PGD"
+            st.caption(f"🏢 Theo dõi chung **{len(kq_list)}** {label_dv}")
+
+        if not kq_list:
+            st.warning(f"Không tìm thấy dữ liệu {label_dv}. Thử tạo lại đầu việc.")
+            return
+
+        xong = sum(1 for r in kq_list if r["trang_thai"] == "da_hoan_thanh")
+        tong = len(kq_list)
+        pct = round(xong / tong * 100) if tong else 0
+
+        # ── Khối 3: CẬP NHẬT TIẾN ĐỘ ─────────────────────────────────────
+        with st.container(border=True):
+            st.markdown("**③ CẬP NHẬT TIẾN ĐỘ**")
+
+            # Progress + thống kê
+            st.progress(
+                xong / tong,
+                text=f"✅ **{xong}/{tong}** {label_dv} hoàn thành  ·  "
+                     f"⬜ **{tong - xong}** chưa thực hiện  ·  **{pct}%**",
+            )
+
+            confirm_key = f"_td_confirm_save_{task_id}_{pgd_sel}"
+            editor_key = f"td_editor_{task_id}_{pgd_sel}"
+
+            an_da_ht = st.toggle("Ẩn đơn vị đã hoàn thành", key=f"td_an_ht_{task_id}_{pgd_sel}")
+
+            editor_key = f"td_editor_{task_id}_{pgd_sel}_{an_da_ht}"
+
+            def _parse_date(val):
+                if not val:
+                    return None
+                try:
+                    return pd.to_datetime(val).date()
+                except Exception as e:  # conv: skip
+                    logger.warning("_parse_date không hợp lệ '%s': %s", val, e)
+                    return None
+
+            kq_hien_thi = kq_list
+            if an_da_ht:
+                kq_hien_thi = [r for r in kq_list if r["trang_thai"] != "da_hoan_thanh"]
+
+            df_edit = pd.DataFrame([
+                {
+                    ten_cot: r["ten_xa"],
+                    "Trạng thái": TS_KQ_LABEL.get(r["trang_thai"], r["trang_thai"]),
+                    "Hoàn thành": r["trang_thai"] == "da_hoan_thanh",
+                    "% HT": int(r.get("pct_hoan_thanh") or 0),
+                    "Ngày hoàn thành": _parse_date(r.get("ngay_hoan_thanh")),
+                    "Ghi chú": r.get("ghi_chu") or "",
+                }
+                for r in kq_hien_thi
+            ])
+
+            # Action bar: Lưu + Hoàn tác + thống kê
+            c_save, c_reset, c_info = st.columns([1.5, 1, 4])
+            with c_save:
+                if st.session_state.get(confirm_key):
+                    st.warning("⚠️ Xác nhận lưu?")
+                    c_ok, c_huy = st.columns(2)
+                    with c_ok:
+                        if st.button("✅ Xác nhận", type="primary", use_container_width=True,
+                                     key=f"{confirm_key}_ok"):
+                            state = st.session_state.get(editor_key, {})
+                            edited = df_edit.copy()
+                            if isinstance(state, dict):
+                                for row_idx, changes in state.get("edited_rows", {}).items():
+                                    for col, val in changes.items():
+                                        edited.at[int(row_idx), col] = val
+                            elif isinstance(state, pd.DataFrame):
+                                edited = state
+                            if edited.empty:
+                                st.session_state.pop(confirm_key, None)
+                                st.rerun()
+                            rows_bulk: list[dict] = []
+                            for i in range(len(edited)):
+                                ten_xa_dv = edited.iloc[i][ten_cot]
+                                ngay_val = edited.iloc[i]["Ngày hoàn thành"]
+                                ngay_ht = None
+                                if pd.notna(ngay_val) and ngay_val:
+                                    try:
+                                        ngay_ht = pd.to_datetime(ngay_val).date().isoformat()
+                                    except Exception as e:  # conv: skip
+                                        logger.warning("ngay_ht không hợp lệ: %s", e)
+                                        ngay_ht = None
+                                rows_bulk.append(
+                                    {
+                                        "ten_xa": ten_xa_dv,
+                                        "hoan_thanh": bool(edited.iloc[i]["Hoàn thành"]),
+                                        "pct_hoan_thanh": int(edited.iloc[i].get("% HT") or 0),
+                                        "ngay_hoan_thanh": ngay_ht,
+                                        "ghi_chu": str(edited.iloc[i]["Ghi chú"]).strip() or None,
+                                    }
+                                )
+                            count, errors = tien_do_service.cap_nhat_ketqua_bulk(
+                                task_id=task_id,
+                                cap_theo_doi=cap_theo_doi,
+                                pgd_sel=pgd_sel,
+                                rows=rows_bulk,
+                                username=username,
+                            )
+                            for ten_xa_dv, err in errors:
+                                st.warning(f"Lỗi {ten_xa_dv}: {err}")
+                            db.ghi_audit(username, "tien_do_cap_nhat_xa",
+                                         f"Task '{task['tieu_de']}' · {count} {label_dv}")
+                            st.session_state.pop(editor_key, None)
+                            st.session_state.pop(confirm_key, None)
+                            st.session_state.pop(f"{editor_key}_data", None)
+                            st.toast(f"✅ Đã lưu {count} {label_dv}.")
+                            st.rerun()
+                    with c_huy:
+                        if st.button("❌ Hủy", use_container_width=True,
+                                     key=f"{confirm_key}_cancel"):
+                            st.session_state.pop(confirm_key, None)
+                            st.rerun()
+                else:
+                    if st.button("💾 Lưu thay đổi", type="primary", use_container_width=True,
+                                 key=f"{confirm_key}_btn"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+            with c_reset:
+                if st.button("↩️ Hoàn tác", use_container_width=True,
+                             key=f"_td_undo_{task_id}_{pgd_sel}"):
+                    base = f"td_editor_{task_id}_{pgd_sel}"
+                    for k in list(st.session_state.keys()):
+                        if k.startswith(base) or k.startswith(confirm_key):
+                            st.session_state.pop(k, None)
+                    st.rerun()
+            with c_info:
+                ht = tong - xong
+                _thong_ke = f"✅ {xong} · ⬜ {ht} · {pct}%"
+                if an_da_ht:
+                    _thong_ke += f" · 👁 Đang ẩn {xong} đã hoàn thành"
+                _thong_ke += " · Tick ☑ để đánh dấu hoàn thành"
+                st.caption(_thong_ke)
+
+            # Data editor — cache dữ liệu vào session_state để nút lưu dùng được
+            edited = st.data_editor(
+                df_edit,
+                column_config={
+                    ten_cot: st.column_config.TextColumn(ten_cot, disabled=True),
+                    "Trạng thái": st.column_config.TextColumn(
+                        "Trạng thái", disabled=True, width="small",
+                    ),
+                    "Hoàn thành": st.column_config.CheckboxColumn("✅ Hoàn thành"),
+                    "% HT": st.column_config.NumberColumn(
+                        "% HT", min_value=0, max_value=100, step=5, width="small",
+                        help="Nhập % hoàn thành (0–100). Khi = 100 tự đánh dấu hoàn thành.",
+                    ),
+                    "Ngày hoàn thành": st.column_config.DateColumn(
+                        "Ngày hoàn thành", format="DD/MM/YYYY", default=None,
+                    ),
+                    "Ghi chú": st.column_config.TextColumn(width="large"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                key=editor_key,
+            )
+            st.session_state[f"{editor_key}_data"] = edited
+
+        # ── Khối 4: LỊCH SỬ CẬP NHẬT ────────────────────────────────────────
+        with st.expander("📜 Lịch sử cập nhật tiến độ", expanded=False):
+            _pgd_filter = pgd_sel if pgd_sel != "__ALL__" else None
+            try:
+                ls_rows = tien_do_service.doc_lich_su_task(
+                    task_id,
+                    pgd=_pgd_filter,
+                    limit=100,
+                )
+            except Exception as e:  # conv: skip
+                logger.warning("Lỗi đọc lịch sử task_id=%s: %s", task_id, e)
+                ls_rows = []
+
+            if not ls_rows:
+                st.caption("Chưa có lịch sử thay đổi nào được ghi nhận.")
+            else:
+                _TS_LABEL = {
+                    "chua_thuc_hien": "⬜ Chưa",
+                    "da_hoan_thanh":  "✅ Xong",
+                    "khong_ap_dung":  "➖ N/A",
+                }
+                df_ls = pd.DataFrame([
+                    {
+                        "Thời gian":  (r.get("ngay_nhap") or "")[:16].replace("T", " "),
+                        "Đơn vị":     r.get("ten_xa") or "",
+                        "PGD":        r.get("pgd") or "",
+                        "Trước":      _TS_LABEL.get(r.get("trang_thai_cu") or "", r.get("trang_thai_cu") or "—"),
+                        "Sau":        _TS_LABEL.get(r.get("trang_thai_moi") or "", r.get("trang_thai_moi") or "—"),
+                        "% trước":    int(r.get("pct_cu") or 0),
+                        "% sau":      int(r.get("pct_moi") or 0),
+                        "Ghi chú":    r.get("ghi_chu") or "",
+                        "Người nhập": r.get("nguoi_nhap") or "",
+                    }
+                    for r in ls_rows
+                ])
+                # Ẩn cột PGD nếu đang lọc theo 1 PGD cụ thể
+                cols_show = list(df_ls.columns)
+                if _pgd_filter:
+                    cols_show = [c for c in cols_show if c != "PGD"]
+                st.dataframe(
+                    df_ls[cols_show],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(400, 40 + len(df_ls) * 35),
+                )
+                st.caption(f"Hiển thị {len(df_ls)} bản ghi gần nhất.")
+
+
+def _render_xuat(tab, **kwargs):
+    SS_KEY = "_td_xuat_excel"
+    username = kwargs.get("username", "")
+    _tab_ctx = tab if tab is not None else __import__('streamlit').container()
+    with _tab_ctx:
+        st.subheader("📤 Xuất báo cáo tiến độ")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            tu_ngay = st.date_input("Thời hạn từ", value=date.today(), format="DD/MM/YYYY", key="td_x1")
+        with c2:
+            den_ngay = st.date_input("Thời hạn đến", value=date.today(), format="DD/MM/YYYY", key="td_x2")
+
+        SS_PDF_BAOCAO = "_td_pdf_baocao"
+
+        if st.button("📄 Xuất PDF báo cáo tiến độ", type="primary", key="td_btn_pdf_baocao"):
+            ds_task = _doc_tasks(chi_dang_theo_doi=False)
+            ds_task = [t for t in ds_task
+                       if tu_ngay.isoformat() <= t["ngay_deadline"] <= den_ngay.isoformat()]
+            if not ds_task:
+                st.info("Không có đầu việc trong khoảng thời gian đã chọn.")
+            else:
+                pdf_buf = _xuat_pdf_bao_cao_tien_do(ds_task, username)
+                if pdf_buf:
+                    st.session_state[SS_PDF_BAOCAO] = {
+                        "data": pdf_buf.getvalue(),
+                        "filename": f"baocao_tiendo_{datetime.now().strftime('%Y%m%d')}.pdf",
+                    }
+                    db.ghi_audit(username, "tien_do_xuat_pdf_baocao",
+                                 f"{len(ds_task)} đầu việc")
+                    st.rerun()
+
+        if st.session_state.get(SS_PDF_BAOCAO):
+            _p = st.session_state[SS_PDF_BAOCAO]
+            st.download_button(
+                "⬇ Tải PDF báo cáo tiến độ",
+                data=_p["data"],
+                file_name=_p["filename"],
+                mime="application/pdf",
+                key="td_pdf_baocao_dl",
+                use_container_width=True,
+            )
+
+        if st.button("📥 Tạo Excel", type="primary", key="td_btn_tao"):
+            ds_task = _doc_tasks(chi_dang_theo_doi=False)
+            ds_task = [t for t in ds_task
+                       if tu_ngay.isoformat() <= t["ngay_deadline"] <= den_ngay.isoformat()]
+
+            if not ds_task:
+                st.session_state.pop(SS_KEY, None)
+                st.info("Không có đầu việc trong khoảng thời gian đã chọn.")
+                st.stop()
+
+            hom_nay = date.today().isoformat()
+
+            # Sheet 0: Tổng hợp đầu việc
+            summary_rows = []
+            for i, t in enumerate(ds_task, 1):
+                kq = _doc_ketqua_task(t["id"])
+                xong  = sum(1 for r in kq if r["trang_thai"] == "da_hoan_thanh")
+                chua  = sum(1 for r in kq if r["trang_thai"] == "chua_thuc_hien")
+                tre   = sum(1 for r in kq
+                            if r["trang_thai"] == "chua_thuc_hien"
+                            and t["ngay_deadline"] < hom_nay)
+                na    = sum(1 for r in kq if r["trang_thai"] == "khong_ap_dung")
+                tong  = len(kq)
+                ds_p  = json.loads(t.get("ds_pgd") or "[]")
+                summary_rows.append({
+                    "STT":           i,
+                    "Đầu việc":      t["tieu_de"],
+                    "Loại":          LOAI_TASK.get(t["loai"], t["loai"]),
+                    "Ưu tiên":       UU_TIEN.get(t["uu_tien"], t["uu_tien"]).replace("🔴","").replace("🟡","").replace("🟢","").strip(),
+                    "Thời hạn":      t["ngay_deadline"],
+                    "Số PGD":        len(ds_p),
+                    "Tổng xã":       tong,
+                    "Đã hoàn thành": xong,
+                    "Chưa thực hiện": chua - tre,
+                    "Trễ hạn":       tre,
+                    "N/A":           na,
+                    "Tỷ lệ HT%":    round(xong / tong * 100, 1) if tong else 0,
+                    "Loại theo dõi": "Chung PGD" if t.get("cap_theo_doi") == "pgd" else "Chi tiết xã",
+                    "Ngày bắt đầu": t.get("ngay_bat_dau") or "",
+                    "Người phụ trách": t.get("nguoi_phu_trach") or "",
+                    "CB KH-NV phụ trách": t.get("nguoi_thuc_hien_cn") or "",
+                    "Hội sở CN tỉnh": t.get("cbtd_bien_hoa") or "",
+                })
+            df_tonghop = pd.DataFrame(summary_rows)
+
+            # Sheet 1: Ma trận PGD × đầu việc
+            bang_rows = []
+            for pgd in DS_PGD_ALL:
+                row = {"Đơn vị": pgd}
+                for t in ds_task:
+                    kq = [r for r in _doc_ketqua_task(t["id"]) if r["pgd"] == pgd]
+                    xong = sum(1 for r in kq if r["trang_thai"] == "da_hoan_thanh")
+                    tre = sum(1 for r in kq
+                              if r["trang_thai"] == "chua_thuc_hien"
+                              and t["ngay_deadline"] < hom_nay)
+                    row[f"{t['tieu_de'][:18]} (#{t['id']})"] = f"{xong}/{len(kq)}" + ("🔴" if tre else "")
+                bang_rows.append(row)
+            df_matran = pd.DataFrame(bang_rows)
+
+            # Sheet 2: Chi tiết theo xã
+            rows_ct = []
+            for t in ds_task:
+                kq = _doc_ketqua_task(t["id"])
+                for r in kq:
+                    rows_ct.append({
+                        "Task ID": t["id"],
+                        "Đầu việc": t["tieu_de"],
+                        "Thời hạn": t["ngay_deadline"],
+                        "PGD": r["pgd"],
+                        "Xã / Phường": r["ten_xa"],
+                        "Trạng thái": TS_KQ_LABEL.get(r["trang_thai"], r["trang_thai"]),
+                        "Ngày hoàn thành": r.get("ngay_hoan_thanh") or "",
+                        "Ghi chú": r.get("ghi_chu") or "",
+                    })
+            df_ct = pd.DataFrame(rows_ct)
+
+            excel_data = _xuat_excel_tien_do(df_tonghop, df_matran, df_ct)
+
+            st.session_state[SS_KEY] = {
+                "data": excel_data,
+                "filename": f"TienDoCongViec_{date.today().isoformat()}.xlsx",
+                "n_task": len(ds_task),
+                "n_ct": len(df_ct),
+                "n_th": len(df_tonghop),
+            }
+            st.rerun()
+
+        if SS_KEY in st.session_state:
+            payload = st.session_state[SS_KEY]
+            col_dl, col_clear = st.columns([4, 1])
+            with col_dl:
+                st.download_button(
+                    label="⬇ Tải Excel báo cáo tiến độ",
+                    data=payload["data"],
+                    file_name=payload["filename"],
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="td_xuat_dl",
+                )
+            with col_clear:
+                if st.button("✕", key="td_xuat_clear", help="Tạo lại"):
+                    del st.session_state[SS_KEY]
+                    st.rerun()
+            st.success(f"Đã xuất {payload['n_task']} đầu việc · "
+                       f"{payload['n_ct']} dòng chi tiết · "
+                       f"{payload['n_th']} đầu việc tổng hợp.")
+
+        st.divider()
+        st.markdown("### 📄 Xuất PDF tiến độ theo task")
+
+        ds_task_pdf = _doc_tasks(chi_dang_theo_doi=False)
+        if not ds_task_pdf:
+            st.info("Chưa có đầu việc nào.")
+        else:
+            task_map_pdf = {t["id"]: t for t in ds_task_pdf}
+
+            def _fmt_task_pdf(task_id):
+                t = task_map_pdf.get(task_id) or {}
+                if t.get("trang_thai") == "dang_theo_doi":
+                    try:
+                        dl = date.fromisoformat(t.get("ngay_deadline", ""))
+                        stt = "⚠️ Đã hết hạn" if dl < date.today() else "🟢 Đang thực hiện"
+                    except Exception as e:  # conv: skip
+                        logger.warning("Không parse ngày deadline (fmt_task_pdf) task_id=%s: %s", task_id, e)
+                        stt = "🟢 Đang thực hiện"
+                else:
+                    stt = "🔒 Đã đóng"
+                parts = [stt, t.get("tieu_de", "")]
+                ngay_bd = t.get("ngay_bat_dau")
+                if ngay_bd:
+                    parts.append(f"BĐ: {fmt_ngay(ngay_bd)}")
+                parts.append(f"KT: {fmt_ngay(t.get('ngay_deadline', ''))}")
+                return " · ".join(parts)
+
+            task_id_pdf = st.selectbox(
+                "Chọn đầu việc",
+                options=list(task_map_pdf.keys()),
+                format_func=_fmt_task_pdf,
+                key="td_xuat_pdf_task",
+            )
+            task_pdf = task_map_pdf.get(task_id_pdf)
+
+            if task_pdf and st.button(
+                "📄 Xuất PDF tiến độ",
+                type="primary",
+                key="td_btn_xuat_pdf"
+            ):
+                kq_all = _doc_ketqua_task(task_id_pdf)
+                pdf_bytes = _xuat_pdf_tien_do(task_pdf, kq_all, username)
+                if pdf_bytes:
+                    ten_file = (
+                        f"TienDo_{task_pdf['tieu_de'][:20].replace(' ', '_')}_"
+                        f"{date.today().isoformat()}.pdf"
+                    )
+                    st.session_state["_td_pdf_bytes"] = pdf_bytes
+                    st.session_state["_td_pdf_file"] = ten_file
+                    db.ghi_audit(
+                        username, "tien_do_xuat_pdf",
+                        f"Task '{task_pdf['tieu_de']}'"
+                    )
+                    st.rerun()
+
+            if st.session_state.get("_td_pdf_bytes"):
+                st.download_button(
+                    "⬇ Tải PDF",
+                    data=st.session_state["_td_pdf_bytes"],
+                    file_name=st.session_state.get("_td_pdf_file", "TienDo.pdf"),
+                    mime="application/pdf",
+                    key="td_pdf_dl",
+                    use_container_width=True,
+                )
+
+
+
+
+
+
+
+from tabs.base_tab import TabContext
+
+
+
+
+def render(tab, **kwargs):
+    ctx = TabContext(tab, **kwargs)
+    with ctx:
+        st.subheader("📅 Tiến độ Công việc Hàng ngày")
+
+        if ctx.is_exec:
+            _render_tong_quan(tab, **kwargs)
+            return
+
+        if ctx.is_pgd:
+            lazy_tabs(
+                ["📊 Tổng quan", "📋 Cập nhật tiến độ"],
+                [
+                    lambda: _render_tong_quan(st.container(), **kwargs),
+                    lambda: _render_cap_nhat(st.container(), **kwargs),
+                ],
+                key="td_pgd",
+            )
+            return
+
+        if not ctx.is_cn:
+            _render_tong_quan(tab, **kwargs)
+            return
+
+        lazy_tabs(
+            ["📊 Tổng quan", "➕ Tạo đầu việc mới", "✏️ Chỉnh sửa & Xóa đầu việc",
+             "📋 Cập nhật tiến độ", "📤 Xuất báo cáo"],
+            [
+                lambda: _render_tong_quan(st.container(), **kwargs),
+                lambda: _render_tao_task(st.container(), **kwargs),
+                lambda: _render_quan_ly_task(st.container(), **kwargs),
+                lambda: _render_cap_nhat(st.container(), **kwargs),
+                lambda: _render_xuat(st.container(), **kwargs),
+            ],
+            key="td_cn",
+        )
+
+
+def render_tong_quan_only(tab, **kwargs):
+    ctx = TabContext(tab, **kwargs)
+    with ctx:
+        st.subheader("📅 Tiến độ Công việc Hàng ngày")
+        _render_tong_quan(tab, **kwargs)

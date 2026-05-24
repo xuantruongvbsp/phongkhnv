@@ -1,0 +1,228 @@
+"""Tab NQ11."""
+from __future__ import annotations
+
+from io import BytesIO
+from datetime import datetime, date
+from typing import TYPE_CHECKING
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
+from config import *
+from utils import fmt_ty, xuat_excel, ten_file_xuat, hien_thi_dataframe_phan_trang
+from data import ts_file
+from state_manager import SCMStateManager
+
+if TYPE_CHECKING:
+    from streamlit.delta_generator import DeltaGenerator
+
+
+def _tao_column_config_nq11() -> dict[str, st.column_config.Column]:
+    """
+    Tạo column_config cho bảng NQ11.
+    
+    Returns:
+        Dict cấu hình column cho st.dataframe
+    """
+    return {
+        "Dư_nợ_NQ11": st.column_config.NumberColumn(
+            "Dư nợ NQ11\n(triệu đồng)",
+            format="%.0f",
+            help="Dư nợ Nghị Quyết 11"
+        ),
+        "Nợ_trong_hạn": st.column_config.NumberColumn(
+            "Nợ trong hạn\n(triệu đồng)",
+            format="%.0f",
+            help="Nợ trong hạn"
+        ),
+        "Nợ_quá_hạn": st.column_config.NumberColumn(
+            "Nợ quá hạn\n(triệu đồng)",
+            format="%.0f",
+            help="Nợ quá hạn"
+        ),
+        "Số_món": st.column_config.NumberColumn(
+            "Số món",
+            format="%d",
+            help="Số món vay"
+        ),
+        COT_NQ11_SO_TIEN_GN: st.column_config.NumberColumn(
+            "Số tiền giải ngân\n(triệu đồng)",
+            format="%.0f",
+            help="Số tiền giải ngân"
+        ),
+        COT_DNO_NQ11: st.column_config.NumberColumn(
+            "DNO NQ11\n(triệu đồng)",
+            format="%.0f",
+            help="Dư nợ NQ11"
+        ),
+        COT_NQ11_NO_TH: st.column_config.NumberColumn(
+            "Nợ trong hạn\n(triệu đồng)",
+            format="%.0f",
+            help="Nợ trong hạn"
+        ),
+        COT_NQ11_NO_QH: st.column_config.NumberColumn(
+            "Nợ quá hạn\n(triệu đồng)",
+            format="%.0f",
+            help="Nợ quá hạn"
+        ),
+    }
+
+
+def render(tab: DeltaGenerator | None = None, **kwargs: dict) -> None:
+    """
+    Render tab NQ11.
+    
+    Args:
+        tab: Streamlit DeltaGenerator cho tab này
+        **kwargs: Chứa df, df_full, role, pgd_user, username, df_nq11
+    """
+    df = kwargs.get("df")
+    df_full = kwargs.get("df_full", df)
+    role = kwargs.get("role")
+    pgd_user = kwargs.get("pgd_user")
+    username = kwargs.get("username")
+    df_nq11 = kwargs.get("df_nq11")
+
+    _tab_ctx = tab if tab is not None else __import__('streamlit').container()
+    with _tab_ctx:
+            state = SCMStateManager()
+            st.subheader("📑 Dữ liệu Nghị Quyết 11 (NQ11)")
+
+            def fmt_vn_tien(x: float) -> str:
+                """Format số tiền cho metric display (triệu đồng, 0 dp)."""
+                try:
+                    x = float(x)
+                    if abs(x) > 0:
+                        trieu = x / 1_000_000
+                        return f"{trieu:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                    return "—"
+                except Exception:
+                    return "—"
+
+            if df_nq11 is None:
+                st.warning("⚠️ Chưa có file dữ liệu NQ11.")
+                st.info(f"Vui lòng đặt file vào: {FILE_PATH_NQ11} rồi bấm Làm mới dữ liệu.")
+            else:
+                df_nq11 = df_nq11.copy()
+                for _c in [COT_DNO_NQ11, COT_NQ11_NO_TH, COT_NQ11_NO_QH, COT_NQ11_SO_TIEN, COT_NQ11_DU_NO, COT_NQ11_SO_TIEN_GN]:
+                    if _c in df_nq11.columns:
+                        df_nq11[_c] = pd.to_numeric(df_nq11[_c], errors="coerce").fillna(0)
+
+                # ── Chỉ số tổng quan ──
+                tong_mon     = len(df_nq11)
+                co_nq11      = df_nq11[df_nq11[COT_DNO_NQ11] > 0]
+                khong_nq11   = df_nq11[df_nq11[COT_DNO_NQ11] == 0]
+                tong_dno_nq11= co_nq11[COT_DNO_NQ11].sum()
+                tong_no_th   = df_nq11[COT_NQ11_NO_TH].sum()  if COT_NQ11_NO_TH in df_nq11.columns else 0
+                tong_no_qh   = df_nq11[COT_NQ11_NO_QH].sum()  if COT_NQ11_NO_QH in df_nq11.columns else 0
+
+                c1,c2,c3,c4,c5 = st.columns(5)
+                c1.metric("Tổng số món",       f"{tong_mon:,}".replace(",","."))
+                c2.metric("Món có NQ11",        f"{len(co_nq11):,}".replace(",","."))
+                c3.metric("Dư nợ NQ11",         fmt_vn_tien(tong_dno_nq11))
+                c4.metric("Tổng nợ trong hạn",  fmt_vn_tien(tong_no_th))
+                c5.metric("Tổng nợ quá hạn",    fmt_vn_tien(tong_no_qh))
+
+                st.divider()
+
+                # ── Bộ lọc ──
+                with st.expander("🔧 Bộ lọc", expanded=True):
+                    lf1, lf2, lf3 = st.columns(3)
+                    with lf1:
+                        loai_loc = st.selectbox("Lọc theo NQ11",
+                            ["Tất cả", "Chỉ món có NQ11", "Chỉ món không có NQ11"], key="nq11_loai")
+                    with lf2:
+                        if COT_TEN_CT in df_nq11.columns:
+                            ds_ct_nq = ["Tất cả"] + sorted(df_nq11[COT_TEN_CT].dropna().unique().tolist())
+                            loc_ct   = st.selectbox("Chương trình", ds_ct_nq, key="nq11_ct")
+                        else: loc_ct = "Tất cả"
+                    with lf3:
+                        if COT_TEN_XA in df_nq11.columns:
+                            ds_xa = ["Tất cả"] + sorted(df_nq11[COT_TEN_XA].dropna().unique().tolist())
+                            loc_xa = st.selectbox("Xã", ds_xa, key="nq11_xa")
+                        else: loc_xa = "Tất cả"
+
+                # Áp dụng lọc
+                df_loc_nq = df_nq11.copy()
+                if loai_loc == "Chỉ món có NQ11":      df_loc_nq = df_loc_nq[df_loc_nq[COT_DNO_NQ11] > 0]
+                elif loai_loc == "Chỉ món không có NQ11": df_loc_nq = df_loc_nq[df_loc_nq[COT_DNO_NQ11] == 0]
+                if loc_ct != "Tất cả" and COT_TEN_CT in df_loc_nq.columns:
+                    df_loc_nq = df_loc_nq[df_loc_nq[COT_TEN_CT] == loc_ct]
+                if loc_xa != "Tất cả" and COT_TEN_XA in df_loc_nq.columns:
+                    df_loc_nq = df_loc_nq[df_loc_nq[COT_TEN_XA] == loc_xa]
+
+                # Tóm tắt sau lọc
+                m1,m2,m3 = st.columns(3)
+                m1.metric("Số món hiển thị",  f"{len(df_loc_nq):,}".replace(",","."))
+                m2.metric("Dư nợ NQ11",       fmt_vn_tien(df_loc_nq[COT_DNO_NQ11].sum()))
+                m3.metric("Nợ trong hạn",     fmt_vn_tien(df_loc_nq[COT_NQ11_NO_TH].sum() if COT_NQ11_NO_TH in df_loc_nq.columns else 0))
+
+                # ── Bảng tổng hợp theo chương trình ──
+                st.divider()
+                st.markdown("**📊 Tổng hợp theo chương trình**")
+                if COT_TEN_CT in df_loc_nq.columns:
+                    th_ct = df_loc_nq.groupby(COT_TEN_CT).agg(
+                        Số_món        = (COT_NQ11_MA_KH, "count"),
+                        Dư_nợ_NQ11    = (COT_DNO_NQ11,   "sum"),
+                        Nợ_trong_hạn  = (COT_NQ11_NO_TH, "sum"),
+                        Nợ_quá_hạn    = (COT_NQ11_NO_QH, "sum"),
+                    ).sort_values("Dư_nợ_NQ11", ascending=False).reset_index()
+                    hien_thi_dataframe_phan_trang(
+                        th_ct,
+                        key="nq11_th_ct",
+                        column_config=_tao_column_config_nq11(),
+                    )
+
+                # ── Danh sách chi tiết ──
+                st.divider()
+                st.markdown("**📋 Danh sách chi tiết**")
+                cot_hien_nq = [c for c in [
+                    COT_TEN_XA, COT_TEN_THON, COT_NQ11_MA_KH, COT_NQ11_TEN_KH,
+                    COT_SDT, COT_SO_KU, COT_TEN_CT,
+                    COT_NQ11_SO_TIEN_GN, COT_NQ11_NO_TH, COT_NQ11_NO_QH, COT_DNO_NQ11,
+                    COT_NQ11_DEN_HAN_SC, COT_NQ11_NGAY_BC
+                ] if c in df_loc_nq.columns]
+
+                # Hiển thị với column_config thay vì apply format
+                df_hien_nq = df_loc_nq[cot_hien_nq].copy()
+                hien_thi_dataframe_phan_trang(
+                    df_hien_nq.reset_index(drop=True),
+                    key="nq11_ds_chi_tiet",
+                    column_config=_tao_column_config_nq11(),
+                    height=350,
+                )
+
+                # ── Xuất Excel ──
+                st.divider()
+                if st.button("📥 Xuất dữ liệu NQ11 ra Excel", type="primary", key="btn_nq11_xuat"):
+                    buf = BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                        # Sheet 1: Tổng hợp chương trình (số gốc)
+                        th_ct.to_excel(w, index=False, sheet_name="Tổng hợp CT")
+                        # Sheet 2: Danh sách chi tiết (số gốc)
+                        df_loc_nq[cot_hien_nq].to_excel(w, index=False, sheet_name="Chi tiết")
+                        # Sheet 3: Chỉ món NQ11
+                        if loai_loc != "Chỉ món không có NQ11":
+                            df_loc_nq[df_loc_nq[COT_DNO_NQ11]>0][cot_hien_nq].to_excel(
+                                w, index=False, sheet_name="Chỉ món NQ11")
+                    state.downloads.set(
+                        "nq11_excel",
+                        buf.getvalue(),
+                        f"NQ11_{datetime.today().strftime('%d%m%Y')}.xlsx",
+                    )
+
+                if state.downloads.has("nq11_excel"):
+                    if st.download_button(
+                        "⬇ Tải file Excel",
+                        data=state.downloads.get_bytes("nq11_excel"),
+                        file_name=state.downloads.get_filename("nq11_excel") or f"NQ11_{datetime.today().strftime('%d%m%Y')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_nq11",
+                    ):
+                        state.downloads.clear("nq11_excel")
+
+        # =============================================
+        # TAB CÂN ĐỐI NGUỒN VỐN  (dữ liệu Điện báo — toàn chi nhánh)
+        # =============================================

@@ -1,0 +1,19 @@
+[theme]
+base = "dark"
+primaryColor = "#42A5F5"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1E2130"
+textColor = "#FFFFFF"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+fileWatcherType = "watchdog"
+runOnSave = true
+folderWatchBlacklist = ["cache", "pgd_data", "data/baseline", "data/baseline_pgd", "__pycache__", ".git", "logs"]
+
+[client]
+showErrorDetails = true

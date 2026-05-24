@@ -1,0 +1,85 @@
+# ── Python cache ─────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+.virtualenvs/
+.conda/
+conda-env/
+
+# ── Biến môi trường / bảo mật (QUAN TRỌNG: chứa API key, mật khẩu) ───────────
+.env
+*.env
+.env.local
+.env.production
+secrets.toml
+.streamlit/secrets.toml
+
+# ── Data files (lớn, không cần AI đọc) ───────────────────────────────────────
+pgd_data/
+cache/
+*.parquet
+*.csv
+*.xlsx
+*.xls
+
+# ── Cơ sở dữ liệu (binary, AI không đọc được) ────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+*.accdb
+*.mdb
+
+# ── Tài liệu PDF (chỉ đọc khi chủ động cung cấp) ─────────────────────────────
+*.pdf
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Log và temp ───────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+logs/
+temp/
+tmp/
+# kv_store audit logs (db.ghi_kv / db.ghi_audit)
+kv_audit.log
+audit_*.log
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
+
+# ── Streamlit cache ───────────────────────────────────────────────────────────
+.streamlit/cache/
+
+# ── Snapshot và backup ────────────────────────────────────────────────────────
+snapshots/
+backups/
+*.bak.py
+
+# ── File hệ thống đồng bộ (Dropbox, macOS, Windows) ──────────────────────────
+.dropbox
+.dropbox.cache/
+.dropbox*
+.DS_Store
+desktop.ini
+Thumbs.db
+
+# ── Dữ liệu khu vực / địa lý (dung lượng lớn) ────────────────────────────────
+pgd_data/**/ban_do/
+pgd_data/**/geojson/
+*.geojson
+*.shp
+*.shx
+*.dbf
